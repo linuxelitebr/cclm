@@ -1,0 +1,20 @@
+# Pre-sanitization backups created during open-source prep
+.pre-sanitize-backup/
+
+# OS / editor cruft
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+
+# Lab-specific files that shouldn't ever be committed
+*.kubeconfig
+kubeconfig*
+*-token.txt
+*.pem
+*.key
+*.crt
+
+# Local backups of state ConfigMap
+cclm-pool-backup-*.yaml
