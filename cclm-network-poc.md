@@ -1,14 +1,32 @@
 # Cross-Cluster Live Migration (CCLM): network setup POC + technical reference
 
-> **Status: PARTIALLY VALIDATED.** Cross-cluster live migration works
-> end-to-end for some VMs (fedora, windows tested OK on 2026-05-04). One
-> VM type (centos-stream9) currently fails mid-PreCopy with
-> `Cannot recv data: Connection reset by peer`: hypothesis is jumbo
-> frame / middlebox PMTU issue, not a guest-OS compat problem.
-> Intra-cluster live migration on the dedicated network works for all
-> tested VMs.
+> **Status: FULLY VALIDATED on OCP 4.20.** As of 2026-05-10, end-to-end
+> cross-cluster live migration works for fedora, rhel9, centos-stream9
+> and windows guests on the validated stack (OCP 4.20.13 + CNV 4.20.x
+> + MCE 2.11 + MTV 2.11.5). Previous centos-stream9 PreCopy failure
+> (jumbo frame / middlebox PMTU hypothesis) no longer reproduces after
+> the supernet CUDN was deployed. Intra-cluster live migration on the
+> dedicated network keeps working as before.
 >
-> **Last updated:** 2026-05-08
+> **Last updated:** 2026-05-10
+>
+> **Update 2026-05-10:** full CCLM workflow validated on OCP 4.20.13
+> + MCE 2.11 + MTV 2.11.5. Three VM guests (centos-stream9, fedora,
+> rhel9) migrated successfully cross-cluster via Plans/Migrations
+> created on the source cluster (hosted -> hosting direction).
+> Automated Phase A (NNCP/IPAM/CUDN) + Phase B (HCO + Forklift
+> patches) via the `cclm` role in `hypershift-automation`. Phase C
+> (MTV cross-cluster Providers) is still manual at this date and
+> required the operator to create on each cluster: a custom
+> ClusterRole (`live-migration-role` per MTV docs), a ServiceAccount
+> in `openshift-cnv`, a ClusterRoleBinding, a long-lived
+> service-account-token Secret, and a Provider + provider-Secret pair
+> per peer in `openshift-mtv`. The supernet pattern's per-cluster /26
+> sub-pool prevented the split-brain failure mode documented in
+> [§9.8](#98-ip-collision-on-shared-l2-shared-subnet-option-a-ipam-split-brain).
+> Empirical confirmation that the `liveMigrationConfig.network` field
+> and the `decentralizedLiveMigration` feature gate ARE both exposed
+> by the HyperConverged CRD on CNV 4.20.x bundled with MCE 2.11.
 >
 > **Update 2026-05-08:** validated end-to-end TCP roundtrip across the
 > `cclm-migration` CUDN via pods on both clusters (no firewall, MTU
@@ -1479,6 +1497,128 @@ Source VM keeps running uninterrupted throughout this: no workload loss.
 | Upstream assembly file | Includes both `virt-setting-openshiftv-lm-feature-gates` AND `virt-setting-mtv-lm-feature-gates` | Only `virt-setting-openshiftv-lm-feature-gates` |
 
 Source for the diff: `openshift/openshift-docs` branches `enterprise-4.20` vs `enterprise-4.21`, file `virt/live_migration/virt-enabling-cclm-for-vms.adoc`.
+
+### 9.10 ForkliftController auto-managed `host` Provider not created on the hosting cluster
+
+**Symptom.** After installing MTV operator and creating ForkliftController on
+the hosting (management) cluster, the MTV web console's Plan creation form
+does not offer the local cluster as a source Provider. Only the cross-cluster
+Providers (peers) appear in the dropdown. Reverse migrations (from hosting
+back to a hosted) are blocked because there is no "source" to pick.
+
+**Diagnosis.** Confirmed empirically on 2026-05-10 (OCP 4.20.13 + MCE 2.11 +
+MTV 2.11.5). The MTV web console populates the "source provider" dropdown
+from the `Provider` CRs in `openshift-mtv`. The local-cluster representative
+is the Provider literally named `host`, which the ForkliftController is
+supposed to create automatically on initial reconcile, with this shape:
+
+```yaml
+apiVersion: forklift.konveyor.io/v1beta1
+kind: Provider
+metadata:
+  name: host
+  namespace: openshift-mtv
+  ownerReferences:
+  - apiVersion: forklift.konveyor.io/v1beta1
+    kind: ForkliftController
+    name: forklift-controller
+    uid: <FC uid>
+spec:
+  secret: {}
+  type: openshift
+  url: ""
+```
+
+The ansible-operator playbook that backs ForkliftController has a task named
+`Setup default provider` (visible in the operator pod logs) that creates this
+record. On healthy installs the task runs during the initial reconcile and
+the `host` Provider appears within ~60 seconds of ForkliftController becoming
+`Successful`.
+
+In the affected hosting (created 16:01 UTC), the playbook completed with
+`ok=54, skipped=28` but the `host` Provider was never materialized.
+Symptomatic state was visible in:
+
+```bash
+# Hosting (broken):
+oc get provider -n openshift-mtv
+# NAME           TYPE        READY
+# wl-linux-lab   openshift   True       ← only the cross-cluster Provider
+#                                         no "host" Provider
+
+# Hosted (healthy, same MTV version):
+oc get provider -n openshift-mtv
+# NAME           TYPE        READY
+# host           openshift   True       ← auto-created by ForkliftController
+# sp1-hst-01     openshift   True       ← cross-cluster Provider
+```
+
+ForkliftController status reported `Successful=True` with stale
+`lastTransitionTime` from the initial reconcile, indicating no follow-up
+reconcile had been triggered after the gap was created.
+
+**Workaround (validated).** Delete the operator pod by name to force a fresh
+ansible-operator startup. Standard `oc rollout restart` was accepted by the
+apiserver but did NOT replace the pod (a new ReplicaSet was created scaled
+to 0, while the old RS stayed at 1). Direct pod delete worked:
+
+```bash
+oc delete pod -n openshift-mtv -l app=forklift,name=controller-manager
+```
+
+Pod is recreated by the Deployment within ~20 seconds. The new ansible-
+operator re-runs the playbook from scratch. The `Setup default provider`
+task creates the missing `host` Provider, which reaches `Ready=True` after
+about 30 more seconds of inventory load.
+
+Empirical timeline observed in the operator logs after restart:
+
+```
+22:43:59  apiserver start
+22:44:28  task: Fetch NetworkAttachmentDefinition for transfer network
+22:44:28  task: Fail if NAD not found
+22:44:29  task: Setup controller deployment
+22:44:50  task: Setup providers validating webhook configuration
+22:44:56  task: Setup providers mutating webhook configuration
+22:44:57  task: Setup default provider          ← creates host Provider
+22:44:58  Cache miss: ... Kind=Provider, openshift-mtv/host
+22:45:01  Provider host appears (Status=Staging)
+22:45:30  Provider host = Ready/Connected/Inventory
+```
+
+**Root cause (hypothesis).** Race condition or state regression in the
+ansible-operator reconcile after `feature_ocp_live_migration` is toggled
+from `"false"` to `"true"` (or some other transient state during initial
+install). Same MTV version on the hosted cluster did NOT exhibit this. The
+two installs differed in the timing between FC creation and the patch that
+enables CCLM features, which is the most likely trigger.
+
+**Why `oc rollout restart` did not work.** Unconfirmed root cause. The
+deployment `forklift-operator` accepted the rollout command (`successfully
+rolled out` returned), a new ReplicaSet `forklift-operator-59bf4bdc4` was
+created, but its replica count stayed at 0 while the old RS
+`forklift-operator-64759d9bb8` stayed at 1. The old pod was never replaced
+despite the rollout being marked successful. Direct pod delete bypassed
+whatever was holding the rollout back.
+
+**Prevention.** Until upstream MTV fixes the underlying race, after every
+MTV install on a hosting (or any cluster where you intend to run the source
+side of a migration), confirm:
+
+```bash
+oc get provider host -n openshift-mtv
+```
+
+If absent, force the operator playbook to re-run with the pod-delete
+workaround above. The role `cclm` in `hypershift-automation` should add
+this check as Tier 1 verification material once Phase C (Providers)
+automation lands.
+
+**Filed as Bugzilla anchor** in `OPEN-SOURCE-TODO.md` under "Publishing
+and upstream feedback" with the title:
+
+> ForkliftController auto-managed "host" Provider intermittently fails to
+> be created on initial install (MTV 2.11.5, OCP 4.20.13)
 
 ---
 

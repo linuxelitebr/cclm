@@ -221,6 +221,7 @@ Pod mask equals the supernet mask (/16), so cross-cluster IPs are on-link via AR
 | CUDN spec change rejected: `spec.network: Invalid value: object: Network spec is immutable` | CUDN spec is immutable by design. | Delete the CUDN, wait for the finalizer to drain pods, recreate with the new spec (maintenance window). |
 | Pod's secondary interface not named `net1` as expected | KubeVirt names it `migration0` via annotation `k8s.v1.cni.cncf.io/networks: <name>@migration0`. | Use `interface=="migration0"` in jq queries. |
 | TCP `:9185` refused on a sync-controller IP, but ICMP works | Replica is a follower (leader-elected); only the leader binds `:9185`. | Discover the leader via `oc get lease virt-synchronization-controller -n openshift-cnv`. |
+| Cannot select local cluster as source Provider in MTV Plan creation UI | The auto-managed `Provider/host` is missing on this cluster. Confirmed on MTV 2.11.5 + OCP 4.20: ForkliftController sometimes fails to create the `host` Provider on initial reconcile. | Restart the operator pod to force the ansible-operator playbook to re-run: `oc delete pod -n openshift-mtv -l app=forklift,name=controller-manager`. `oc rollout restart` of the deployment was observed to be accepted but not effective. The `host` Provider appears ~30s later. |
 
 ### Split-brain recovery
 

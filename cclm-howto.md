@@ -614,6 +614,41 @@ oc get pod <virt-handler-pod> -n openshift-cnv -o json | \
 
 There are 2+ replicas; only the **leader** binds to port 9185. Don't hardcode IPs or test connecdc1y to a specific replica: discover via the K8s API or test all replicas. The whole sub-pool (`10.250.X.0/26`) must be cross-cluster reachable so leader failover doesn't break CCLM.
 
+### 8.11 MTV `host` Provider missing on the local cluster
+
+The MTV web console populates the source Provider dropdown from `Provider`
+CRs in `openshift-mtv`. The local cluster's representative is the Provider
+literally named `host`, auto-created by ForkliftController on initial
+reconcile. On MTV 2.11.5 + OCP 4.20 this auto-creation occasionally fails:
+ForkliftController reports `Successful=True` but `Provider/host` never
+materialized. Result: the GUI cannot offer the local cluster as a source
+for reverse migrations, blocking the workflow.
+
+Detection:
+
+```bash
+oc get provider host -n openshift-mtv
+# Error from server (NotFound): providers.forklift.konveyor.io "host" not found
+```
+
+Workaround (force the ansible-operator playbook to re-run from scratch):
+
+```bash
+oc delete pod -n openshift-mtv -l app=forklift,name=controller-manager
+```
+
+The pod is recreated by the Deployment in ~20s. The new ansible-operator
+re-runs the playbook, the task `Setup default provider` creates the
+missing `host` Provider, and it reaches `Ready` ~30s later.
+
+`oc rollout restart deployment/forklift-operator -n openshift-mtv` was
+observed to be accepted (`successfully rolled out`) but did NOT replace
+the running pod (new ReplicaSet stayed at replica 0). Direct pod delete
+is the path that worked.
+
+See [POC §9.10](cclm-network-poc.md#910-forkliftcontroller-auto-managed-host-provider-not-created-on-the-hosting-cluster)
+for full debug timeline and logs.
+
 ---
 
 ## 9. Operational notes
