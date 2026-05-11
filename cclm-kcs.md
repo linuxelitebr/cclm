@@ -1,4 +1,4 @@
-# Configuring Cross-Cluster Live Migration (CCLM) on OpenShift Virtualization 4.21
+# Configuring Cross-Cluster Live Migration (CCLM) on OpenShift Virtualization (4.20 Tech Preview / 4.21+ GA)
 
 ## Issue
 
@@ -8,11 +8,24 @@ Configure CCLM between two CNV-enabled OCP clusters sharing an L2 network segmen
 
 | Component | Version (validated) |
 |---|---|
-| OpenShift | 4.21.x (both clusters on same minor) |
-| OpenShift Virtualization | 4.21.3 (both clusters on same minor) |
-| Migration Toolkit for Virtualization (Forklift) | 2.11 |
+| OpenShift | 4.20.x or 4.21.x. **Both clusters MUST be on the same minor.** Mixing minors causes TLS handshake to fail with `missing selected ALPN property` (see Troubleshooting). |
+| OpenShift Virtualization | 4.20.x (CCLM as Tech Preview) or 4.21.x (CCLM GA). Both clusters on the same minor. |
+| Migration Toolkit for Virtualization (Forklift) | 2.11.5 |
 | Bonding model | OVS Balance-SLB (`br-phy`) |
 | Network | Shared VLAN trunked between clusters' switches, MTU >= 1500 (9000 recommended) |
+
+> **CNV 4.20 vs 4.21 in this procedure.** CNV 4.20 ships CCLM as Tech
+> Preview. The HyperConverged CRD on 4.20 does not expose the
+> `featureGates.decentralizedLiveMigration` gate (only present from
+> 4.21+). The network path works the same on both versions; the
+> explicit gate is simply not available on 4.20. Step 4 below has two
+> variants accordingly. This procedure was validated by Red Hat in lab
+> on both 4.20.x and 4.21.x. For GA support use 4.21+.
+>
+> **Do not mix minors between clusters.** Source and destination must
+> both be 4.20.x or both be 4.21.x. A mixed pair fails handshake at
+> the migration TLS layer; not a configuration problem, a known cross-
+> minor incompatibility.
 
 ## Prerequisites
 
@@ -86,7 +99,24 @@ The CUDN auto-generates a `NetworkAttachmentDefinition` named `cclm-migration` i
 
 ### Step 4: HyperConverged
 
-Patch both clusters to point KubeVirt at the migration network and enable the CCLM feature gate:
+Two variants depending on the CNV version on each cluster. Check first:
+
+```bash
+oc get csv -n openshift-cnv | grep kubevirt-hyperconverged-operator
+```
+
+Confirm whether the `decentralizedLiveMigration` field is exposed by the running HCO CRD:
+
+```bash
+oc get crd hyperconvergeds.hco.kubevirt.io -o yaml \
+  | yq '.spec.versions[] | select(.name=="v1beta1")
+        | .schema.openAPIV3Schema.properties.spec.properties.featureGates.properties
+        | has("decentralizedLiveMigration")'
+```
+
+`true` on CNV 4.21+ (GA), `false`/missing on CNV 4.20 (Tech Preview).
+
+**Variant A: CNV 4.21+ (CCLM is GA).** Patch network + feature gate:
 
 ```bash
 oc patch hyperconverged kubevirt-hyperconverged -n openshift-cnv --type=merge -p '
@@ -103,16 +133,45 @@ spec:
 '
 ```
 
+**Variant B: CNV 4.20 (CCLM is Tech Preview).** The `decentralizedLiveMigration` field is not in the HCO CRD on 4.20. Patch only the network and migration tunables:
+
+```bash
+oc patch hyperconverged kubevirt-hyperconverged -n openshift-cnv --type=merge -p '
+spec:
+  liveMigrationConfig:
+    network: cclm-migration
+    completionTimeoutPerGiB: 800
+    parallelMigrationsPerCluster: 5
+    parallelOutboundMigrationsPerNode: 2
+    progressTimeout: 150
+    allowPostCopy: true
+'
+```
+
+Trying to patch `featureGates.decentralizedLiveMigration` on 4.20 gets rejected by the HCO admission webhook (`unknown field`).
+
 The KubeVirt operator rolls `virt-handler` (DaemonSet) and `virt-synchronization-controller` (Deployment) automatically, taking 1-2 minutes per cluster.
 
 ### Step 5: MTV feature gate
 
-On both clusters:
+On both clusters. The value **must be a bool** (`true`), not the string `"true"`:
 
 ```bash
 oc patch ForkliftController forklift-controller -n openshift-mtv --type=json \
-  -p '[{"op":"add","path":"/spec/feature_ocp_live_migration","value":"true"}]'
+  -p '[{"op":"add","path":"/spec/feature_ocp_live_migration","value":true}]'
 ```
+
+> **Watch out: string-vs-bool trap.** The ForkliftController CR
+> accepts the patch with `"value":"true"` (string) without error, but
+> the operator does not treat the string as truthy. The
+> `feature_ocp_live_migration` flag stays effectively off and
+> cross-cluster migrations fail silently later. Always pass the bool.
+> Verification command (must return `true`, not `"true"`):
+>
+> ```bash
+> oc get ForkliftController forklift-controller -n openshift-mtv \
+>   -o jsonpath='{.spec.feature_ocp_live_migration}{"\n"}'
+> ```
 
 ## Verification
 
@@ -221,7 +280,8 @@ Pod mask equals the supernet mask (/16), so cross-cluster IPs are on-link via AR
 | CUDN spec change rejected: `spec.network: Invalid value: object: Network spec is immutable` | CUDN spec is immutable by design. | Delete the CUDN, wait for the finalizer to drain pods, recreate with the new spec (maintenance window). |
 | Pod's secondary interface not named `net1` as expected | KubeVirt names it `migration0` via annotation `k8s.v1.cni.cncf.io/networks: <name>@migration0`. | Use `interface=="migration0"` in jq queries. |
 | TCP `:9185` refused on a sync-controller IP, but ICMP works | Replica is a follower (leader-elected); only the leader binds `:9185`. | Discover the leader via `oc get lease virt-synchronization-controller -n openshift-cnv`. |
-| Cannot select local cluster as source Provider in MTV Plan creation UI | The auto-managed `Provider/host` is missing on this cluster. Confirmed on MTV 2.11.5 + OCP 4.20: ForkliftController sometimes fails to create the `host` Provider on initial reconcile. | Restart the operator pod to force the ansible-operator playbook to re-run: `oc delete pod -n openshift-mtv -l app=forklift,name=controller-manager`. `oc rollout restart` of the deployment was observed to be accepted but not effective. The `host` Provider appears ~30s later. |
+| Cannot select local cluster as source Provider in MTV Plan creation UI | The auto-managed `Provider/host` is missing on this cluster. Confirmed on MTV 2.11.5 + OCP 4.20 / 4.21: ForkliftController sometimes fails to create the `host` Provider on initial reconcile. Full debug timeline in [`cclm-network-poc.md` §9.10](cclm-network-poc.md). | Restart the operator pod to force the ansible-operator playbook to re-run: `oc delete pod -n openshift-mtv -l app=forklift,name=controller-manager`. `oc rollout restart` of the deployment was observed to be accepted but not effective. The `host` Provider appears ~30s later. |
+| Step 5 patch accepted, but `feature_ocp_live_migration` reads back as `"true"` (string) and migrations still fail | The `value` in the JSON patch was passed as a string. ForkliftController accepts the type without error but does not treat the string as truthy. | Repatch with bool: `-p '[{"op":"replace","path":"/spec/feature_ocp_live_migration","value":true}]'`. Verify with the jsonpath query in Step 5 returns `true`, not `"true"`. |
 
 ### Split-brain recovery
 
@@ -271,7 +331,10 @@ for kc in <source> <dest>; do
     jq -r '.items[] | "\(.metadata.name) ip=" +
       (((.metadata.annotations["k8s.v1.cni.cncf.io/network-status"] // "[]") | fromjson) |
        map(select(.interface=="migration0"))[0].ips // ["NONE"] | tostring)'
-  KUBECONFIG=$kc oc get providers -A
+  KUBECONFIG=$kc oc get providers -n openshift-mtv \
+    -o custom-columns=NAME:.metadata.name,READY:.status.conditions[?\(@.type==\"Ready\"\)].status,URL:.spec.url
+  KUBECONFIG=$kc oc get ForkliftController forklift-controller -n openshift-mtv \
+    -o jsonpath='feature_ocp_live_migration={.spec.feature_ocp_live_migration}{"\n"}'
 done
 ```
 
@@ -280,7 +343,8 @@ done
 - [`cclm-howto.md`](cclm-howto.md): long-form how-to with rationale and architectural context.
 - [`cclm-config-audit.md`](cclm-config-audit.md): full session audit (gotchas, debug trail, all findings).
 - [`cclm-helper.sh`](cclm-helper.sh): IPAM allocation helper (`init`/`list`/`allocate`/`release`/`render`).
-- [`hypershift-automation` repo, role `cclm`](https://github.com/Hypershift-Automation/hypershift-automation): automated Phase A (NNCP/CUDN/IPAM via cclm-helper) and Phase B (HCO + ForkliftController patches), idempotent. Phase C (MTV cross-cluster Providers) is still manual and stays in this repo.
+- [`hypershift-automation` repo, role `cclm`](https://github.com/Hypershift-Automation/hypershift-automation): automated Phase A (NNCP/CUDN/IPAM via cclm-helper) and Phase B (HCO + ForkliftController patches), idempotent. Schema-adaptive: same role works on 4.20 (Tech Preview, network-only patch) and 4.21+ (GA, network + feature gate).
+- [`hypershift-automation` repo, role `cclm-providers`](https://github.com/Hypershift-Automation/hypershift-automation): automated Phase C. Discovers peers from the `cclm-pool` ConfigMap and builds the full mesh of MTV `Provider`/`Secret` pairs across the fleet (`N*(N-1)`), with scoped ClusterRole and long-lived SA tokens. Idempotent. Replaces the manual procedure historically documented in `cclm-howto.md` §8.
 - [`hypershift-automation/scripts/cclm-preflight-migration.sh`](https://github.com/Hypershift-Automation/hypershift-automation/blob/main/scripts/cclm-preflight-migration.sh): pre-flight and auto-cleanup of the known retry blockers (orphan VMIMs, VM/VMI stubs, finalizer-stuck VMIMs). Recommended first step on any stuck migration.
 - OKD 4.21 docs: <https://docs.okd.io/4.21/virt/live_migration/>
 - MTV 2.11: <https://docs.redhat.com/en/documentation/migration_toolkit_for_virtualization/2.11>
