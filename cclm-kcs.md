@@ -11,7 +11,7 @@ Configure CCLM between two CNV-enabled OCP clusters sharing an L2 network segmen
 | OpenShift | 4.20.x or 4.21.x. **Both clusters MUST be on the same minor.** Mixing minors causes TLS handshake to fail with `missing selected ALPN property` (see Troubleshooting). |
 | OpenShift Virtualization | 4.20.x (CCLM as Tech Preview) or 4.21.x (CCLM GA). Both clusters on the same minor. |
 | Migration Toolkit for Virtualization (Forklift) | 2.11.5 |
-| Bonding model | OVS Balance-SLB (`br-phy`) |
+| Bonding model | OVS Balance-SLB (`br-phy`) used in validation. Other bonding modes / bridges work; see callout below. |
 | Network | Shared VLAN trunked between clusters' switches, MTU >= 1500 (9000 recommended) |
 
 > **CNV 4.20 vs 4.21 in this procedure.** CNV 4.20 ships CCLM as Tech
@@ -24,8 +24,20 @@ Configure CCLM between two CNV-enabled OCP clusters sharing an L2 network segmen
 >
 > **Do not mix minors between clusters.** Source and destination must
 > both be 4.20.x or both be 4.21.x. A mixed pair fails handshake at
-> the migration TLS layer; not a configuration problem, a known cross-
-> minor incompatibility.
+> the migration TLS layer; not a configuration problem, a known cross-minor incompatibility.
+>
+> **Bonding model: example, not requirement.** This procedure was
+> developed and validated on OVS Balance-SLB with the OVS bridge
+> `br-phy`, which is the bonding model used by the lab where the
+> material was produced. CCLM is independent of the bonding choice;
+> any working OVN bridge will do. If your environment uses a
+> different bridge (for example `br-vmdata`) and/or a different
+> bonding mode (LACP / 802.3ad, balance-xor, active-backup,
+> linux-bond, etc.), substitute `br-phy` accordingly in the NNCP
+> bridge mappings (Step 1) and in the OVN bridge mappings
+> prerequisite below. The migration VLAN must be trunked on whatever
+> uplink the chosen bridge attaches to. The NNCP and CUDN remain the
+> same; only the bridge name changes.
 
 ## Prerequisites
 
